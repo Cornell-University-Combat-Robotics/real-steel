@@ -1,225 +1,238 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import math
 
-# COCO keypoint names (YOLO pose model uses COCO format)
-KEYPOINT_NAMES = [
-    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
-    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
-    "left_wrist", "right_wrist", "left_hip", "right_hip",
-    "left_knee", "right_knee", "left_ankle", "right_ankle"
-]
+# COCO indices
+KPT = {
+    "left_shoulder": 5,
+    "right_shoulder": 6,
+    "left_wrist": 9,
+    "right_wrist": 10,
+    "left_hip": 11,
+    "right_hip": 12,
+}
 
 CONF_THRES = 0.25
 KP_CONF_THRES = 0.5
 
-def select_joints():
-    """Prompt user to select one or more joints to track (comma-separated)."""
-    print("\n=== Joint Selection ===")
-    print("Available joints:")
-    for i, name in enumerate(KEYPOINT_NAMES):
-        print(f"  {i}: {name}")
-    print("\nSpecial options:")
-    print("  17: hip_center (average of left and right hips)")
-    print("  18: shoulder_center (average of left and right shoulders)")
-    print("\nExamples:")
-    print("  0,1,2,3,4   -> nose + eyes + ears")
-    print("  5,6,7,8,9,10 -> shoulders + elbows + wrists")
-    print("  17,18       -> hip_center + shoulder_center")
+# Punch-distance normalization (tune if needed)
+# d = (shoulder->wrist distance) / shoulder_width
+D_MIN = 1.2   # relaxed arm-ish
+D_MAX = 3.0   # fully extended-ish
 
-    while True:
-        raw = input("\nEnter joint numbers to track (comma-separated): ").strip()
-        try:
-            parts = [p.strip() for p in raw.split(",") if p.strip() != ""]
-            choices = [int(p) for p in parts]
-        except ValueError:
-            print("Invalid input. Use comma-separated integers like: 0,1,2,3,4")
-            continue
-
-        if not choices:
-            print("Please enter at least one number.")
-            continue
-
-        if any(c < 0 or c > 18 for c in choices):
-            print("Invalid choice(s). Use numbers between 0 and 18.")
-            continue
-
-        # Build targets list: (name, idx) where idx=None for special centers
-        targets = []
-        for c in choices:
-            if c == 17:
-                targets.append(("hip_center", None))
-            elif c == 18:
-                targets.append(("shoulder_center", None))
-            else:
-                targets.append((KEYPOINT_NAMES[c], c))
-
-        # Remove duplicates while preserving order
-        seen = set()
-        uniq = []
-        for t in targets:
-            if t not in seen:
-                uniq.append(t)
-                seen.add(t)
-
-        return uniq
-
-def get_joint_position(kpts_xy, kpts_conf, joint_name, joint_idx):
-    """
-    Get position of a requested joint.
-    Returns (x, y) or None if confidence is too low.
-    """
-    if joint_name == "hip_center":
-        lh_i, rh_i = 11, 12
-        if kpts_conf[lh_i] < KP_CONF_THRES or kpts_conf[rh_i] < KP_CONF_THRES:
-            return None
-        lh = kpts_xy[lh_i]
-        rh = kpts_xy[rh_i]
-        return ((lh[0] + rh[0]) / 2.0, (lh[1] + rh[1]) / 2.0)
-
-    if joint_name == "shoulder_center":
-        ls_i, rs_i = 5, 6
-        if kpts_conf[ls_i] < KP_CONF_THRES or kpts_conf[rs_i] < KP_CONF_THRES:
-            return None
-        ls = kpts_xy[ls_i]
-        rs = kpts_xy[rs_i]
-        return ((ls[0] + rs[0]) / 2.0, (ls[1] + rs[1]) / 2.0)
-
-    # Single keypoint
-    if kpts_conf[joint_idx] < KP_CONF_THRES:
-        return None
-    x, y = kpts_xy[joint_idx]
-    return (float(x), float(y))
-
-def bbox_area(box):
-    """Calculate bounding box area."""
-    return max(0, box[2] - box[0]) * max(0, box[3] - box[1])
+# Smoothing (0..1). Higher = snappier.
+SMOOTH_ALPHA = 0.25
 
 def open_camera_macos():
-    """
-    macOS: AVFoundation backend is usually the most reliable.
-    Try index 1 then 0.
-    """
     cap = cv2.VideoCapture(1, cv2.CAP_AVFOUNDATION)
     if not cap.isOpened():
         cap = cv2.VideoCapture(0, cv2.CAP_AVFOUNDATION)
     return cap
 
-# ------------------ main ------------------
+def clamp(x, lo, hi):
+    return lo if x < lo else hi if x > hi else x
 
-targets = select_joints()
-print("\nTracking:", ", ".join([t[0] for t in targets]))
-print("IMPORTANT: Press 'q' while the OpenCV window is focused to quit.\n")
+def lerp(a, b, t):
+    return a + (b - a) * t
 
-model = YOLO("yolo11n-pose.pt")  # faster on CPU
+def get_kpt(kpts_xy, kpts_conf, name):
+    idx = KPT[name]
+    if kpts_conf[idx] < KP_CONF_THRES:
+        return None
+    x, y = kpts_xy[idx]
+    return np.array([float(x), float(y)], dtype=np.float32)
+
+def dist(a, b):
+    return float(np.linalg.norm(a - b))
+
+def bbox_area(box):
+    return max(0.0, (box[2] - box[0])) * max(0.0, (box[3] - box[1]))
+
+def draw_bar(img, x, y, w, h, value_0_1, label):
+    v = clamp(value_0_1, 0.0, 1.0)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (255, 255, 255), 2)
+    fill_w = int(w * v)
+    cv2.rectangle(img, (x, y), (x + fill_w, y + h), (255, 255, 255), -1)
+    cv2.putText(img, f"{label}: {v:.2f}", (x, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+def draw_centered_bar(img, x, y, w, h, value_minus1_1, label):
+    v = clamp(value_minus1_1, -1.0, 1.0)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (255,255,255), 2)
+    mid = x + w // 2
+    cv2.line(img, (mid, y), (mid, y + h), (0,0,0), 2)
+
+    half = w // 2
+    if v >= 0:
+        fill = int(half * v)
+        cv2.rectangle(img, (mid, y), (mid + fill, y + h), (255,255,255), -1)
+    else:
+        fill = int(half * (-v))
+        cv2.rectangle(img, (mid - fill, y), (mid, y + h), (255,255,255), -1)
+
+    cv2.putText(img, f"{label}: {v:.2f}", (x, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+
+def extension01(shoulder, wrist, shoulder_w):
+    """
+    Returns arm extension in [0,1] based on normalized shoulder->wrist distance.
+    """
+    if shoulder is None or wrist is None or shoulder_w is None or shoulder_w <= 1e-6:
+        return None
+    d = dist(shoulder, wrist) / shoulder_w
+    return clamp((d - D_MIN) / (D_MAX - D_MIN), 0.0, 1.0)
+
+# ---------------- Main ----------------
+
+model = YOLO("yolo11n-pose.pt")  # fast on CPU
 
 cap = open_camera_macos()
 assert cap.isOpened(), (
-    "Could not open camera. On macOS, check:\n"
-    "System Settings -> Privacy & Security -> Camera -> allow Terminal/VS Code.\n"
-    "Also try changing the camera index."
+    "Could not open camera. On macOS:\n"
+    "System Settings -> Privacy & Security -> Camera -> allow Terminal/VS Code."
 )
 
-prev_center = None  # (x,y) for keeping the same person
+prev_center = None
+smooth = {
+    "throttle": 0.0,       # -1..1  (right arm forward = +, left arm forward = -)
+    "steer": 0.0,          # -1..1  (shoulder tilt)
+    "right_ext": 0.0,      # 0..1
+    "left_ext": 0.0,       # 0..1
+}
+
+print("Controls:")
+print("  Right arm extension -> throttle UP (+)")
+print("  Left arm extension  -> throttle BACK (-)")
+print("  Shoulder tilt        -> steering (-1..1)")
+print("Focus the OpenCV window and press 'q' to quit.\n")
 
 while True:
     ret, frame = cap.read()
     if not ret or frame is None:
-        # Camera opened but no frames coming through
-        print("ERROR: Camera opened but no frames received.")
+        print("ERROR: no frames received.")
         break
 
-    # Optional speed boost (uncomment)
+    # Optional speed-up:
     # frame = cv2.resize(frame, (640, 360))
 
     r = model.predict(
         frame,
         conf=CONF_THRES,
         iou=0.45,
-        classes=[0],      # person only
+        classes=[0],
         verbose=False,
         device="cpu"
     )[0]
 
     annotated = frame.copy()
 
+    chosen_i = None
     chosen_box = None
-    chosen_positions = None
-    chosen_center = None
 
     if r.keypoints is not None and r.boxes is not None and len(r.boxes) > 0:
-        kpts_xy_all = r.keypoints.xy.cpu().numpy()       # (N,17,2)
-        kpts_conf_all = r.keypoints.conf.cpu().numpy()   # (N,17)
-        boxes = r.boxes.xyxy.cpu().numpy()               # (N,4)
+        kpts_xy_all = r.keypoints.xy.cpu().numpy()
+        kpts_conf_all = r.keypoints.conf.cpu().numpy()
+        boxes = r.boxes.xyxy.cpu().numpy()
 
         candidates = []
         for i in range(len(boxes)):
-            positions = {}
-            for name, idx in targets:
-                pos = get_joint_position(kpts_xy_all[i], kpts_conf_all[i], name, idx)
-                if pos is not None:
-                    positions[name] = pos
-
-            # require at least one selected joint visible
-            if not positions:
+            ls = get_kpt(kpts_xy_all[i], kpts_conf_all[i], "left_shoulder")
+            rs = get_kpt(kpts_xy_all[i], kpts_conf_all[i], "right_shoulder")
+            if ls is None or rs is None:
                 continue
-
-            xs = [p[0] for p in positions.values()]
-            ys = [p[1] for p in positions.values()]
-            center = (sum(xs) / len(xs), sum(ys) / len(ys))
+            center = (ls + rs) * 0.5
             area = bbox_area(boxes[i])
-
-            candidates.append((i, center, area, positions))
+            candidates.append((i, center, area))
 
         if candidates:
-            # Keep same person: nearest to previous center, else biggest
             if prev_center is not None:
                 px, py = prev_center
-                candidates.sort(key=lambda t: (t[1][0] - px) ** 2 + (t[1][1] - py) ** 2)
+                candidates.sort(key=lambda t: (t[1][0]-px)**2 + (t[1][1]-py)**2)
             else:
                 candidates.sort(key=lambda t: -t[2])
 
-            best_i, best_center, _, best_positions = candidates[0]
-            chosen_box = boxes[best_i]
-            chosen_positions = best_positions
-            chosen_center = best_center
+            chosen_i, center, _ = candidates[0]
+            prev_center = (float(center[0]), float(center[1]))
+            chosen_box = boxes[chosen_i]
 
-    if chosen_box is not None:
-        prev_center = chosen_center
+    # Raw (unsmoothed) signals
+    right_ext = None
+    left_ext = None
+    steer = 0.0
+    throttle = 0.0
 
-        # Draw bbox
+    if chosen_i is not None:
+        kxy = r.keypoints.xy.cpu().numpy()[chosen_i]
+        kcf = r.keypoints.conf.cpu().numpy()[chosen_i]
+
+        ls = get_kpt(kxy, kcf, "left_shoulder")
+        rs = get_kpt(kxy, kcf, "right_shoulder")
+        lw = get_kpt(kxy, kcf, "left_wrist")
+        rw = get_kpt(kxy, kcf, "right_wrist")
+
+        shoulder_w = dist(ls, rs) if (ls is not None and rs is not None) else None
+
+        # Arm extensions (0..1)
+        left_ext = extension01(ls, lw, shoulder_w)
+        right_ext = extension01(rs, rw, shoulder_w)
+
+        # Throttle mapping you requested:
+        #   right arm forward => + throttle
+        #   left arm forward  => - throttle
+        # If one arm missing, still works with the other.
+        re = right_ext if right_ext is not None else 0.0
+        le = left_ext if left_ext is not None else 0.0
+        throttle = clamp(re - le, -1.0, 1.0)
+
+        # Steering from shoulder-line tilt
+        # v = rs - ls ; image y increases downward -> sign may feel inverted; flip if needed.
+        v = rs - ls
+        angle = math.degrees(math.atan2(v[1], v[0]))  # 0 = level shoulders
+        steer = clamp(angle / 25.0, -1.0, 1.0)  # 25 degrees = full steer
+
+        # Draw box and keypoints
         x1, y1, x2, y2 = map(int, chosen_box)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (255,255,255), 2)
 
-        # Draw each selected joint
-        for name, (x, y) in chosen_positions.items():
-            cx, cy = int(x), int(y)
-            cv2.circle(annotated, (cx, cy), 6, (0, 255, 255), -1)
-            cv2.putText(
-                annotated,
-                f"{name} ({cx},{cy})",
-                (cx + 8, cy - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                2
-            )
+        for pt in [ls, rs, lw, rw]:
+            if pt is not None:
+                cv2.circle(annotated, (int(pt[0]), int(pt[1])), 6, (255,255,255), -1)
 
     else:
-        cv2.putText(
-            annotated,
-            "Selected joints not found",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 0, 255),
-            2
-        )
         prev_center = None
 
-    cv2.imshow("Multi-Joint Tracking (Single Person)", annotated)
+    # Smooth
+    smooth["right_ext"] = lerp(smooth["right_ext"], (right_ext if right_ext is not None else 0.0), SMOOTH_ALPHA)
+    smooth["left_ext"]  = lerp(smooth["left_ext"],  (left_ext  if left_ext  is not None else 0.0), SMOOTH_ALPHA)
+    smooth["throttle"]  = lerp(smooth["throttle"], throttle, SMOOTH_ALPHA)
+    smooth["steer"]     = lerp(smooth["steer"], steer, SMOOTH_ALPHA)
 
-    # NOTE: 'q' works ONLY when this OpenCV window is focused.
+    # HUD
+    pad = 20
+    bar_w = 320
+    bar_h = 22
+    y0 = pad + 40
+
+    # Throttle centered bar (-1..1)
+    draw_centered_bar(annotated, pad, y0, bar_w, bar_h, smooth["throttle"], "THROTTLE (R-L)")
+    draw_centered_bar(annotated, pad, y0 + 50, bar_w, bar_h, smooth["steer"], "STEER (tilt)")
+    draw_bar(annotated, pad, y0 + 100, bar_w, bar_h, smooth["right_ext"], "RIGHT ARM EXT")
+    draw_bar(annotated, pad, y0 + 150, bar_w, bar_h, smooth["left_ext"], "LEFT ARM EXT")
+
+    # Text summary
+    cv2.putText(
+        annotated,
+        f"Throttle:{smooth['throttle']:+.2f}  Steer:{smooth['steer']:+.2f}  R:{smooth['right_ext']:.2f}  L:{smooth['left_ext']:.2f}",
+        (pad, pad),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255,255,255),
+        2
+    )
+
+    cv2.imshow("Real Steel Test (R arm=forward, L arm=back)", annotated)
+
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
