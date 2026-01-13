@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+from main_helpers import get_motor_groups
+ser, motor_group, weapon_motor_group = get_motor_groups(False, 1, 3, 4)
+
 # COCO indices
 KPT = {
     "left_shoulder": 5,
@@ -256,6 +259,12 @@ while True:
     cv2.imshow("Real Steel Prototype (mirrored, hips+shoulders)", annotated)
     if cv2.waitKey(1) & 0xFF == ord("q"):
         break
+
+    # Broadcasts to controller
+    if steer * -1 > 0:
+        motor_group.move(throttle * 0.8, steer * -1 * 0.55 + 0.2)
+    else:
+        motor_group.move(throttle * 0.8, steer * -1 * 0.55 - 0.2)
 
 cap.release()
 cv2.destroyAllWindows()
