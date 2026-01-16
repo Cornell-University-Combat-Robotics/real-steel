@@ -262,9 +262,9 @@ while True:
 
     # Broadcasts to controller
     if steer * -1 > 0:
-        motor_group.move(throttle * 0.55, steer * -1 * 0.3)
+        motor_group.move(throttle * 0.55, steer * 0.3)
     else:
-        motor_group.move(throttle * 0.55, steer * -1 * 0.3)
+        motor_group.move(throttle * 0.55, steer * 0.3)
 
 cap.release()
 cv2.destroyAllWindows()
